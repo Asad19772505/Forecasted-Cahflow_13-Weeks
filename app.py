@@ -1,6 +1,5 @@
 # app.py
 import io
-import math
 from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
@@ -15,17 +14,14 @@ st.set_page_config(page_title="Interactive Cash Forecast & Financial Management 
 TODAY = datetime.today().date()
 
 def start_of_week(d):
-    # ISO week starts Monday
     d = pd.to_datetime(d).date()
-    return d - timedelta(days=(d.weekday()))
+    return d - timedelta(days=d.weekday())  # Monday
 
 def week_index(d, base_start):
-    # 0..12 relative week index
     return int((start_of_week(d) - base_start).days // 7)
 
 def empty_13w():
     cols = [f"Week {i+1}" for i in range(13)]
-    zero = pd.Series([0.0]*13, index=cols)
     out = pd.DataFrame({
         "Category":[
             "CASH INFLOWS", "Collections", "Other Inflows", "Total Inflows",
@@ -39,7 +35,7 @@ def empty_13w():
 
 def money(x):
     try:
-        return f"${x:,.2f}"
+        return f"${float(x):,.2f}"
     except Exception:
         return "$0.00"
 
@@ -81,7 +77,8 @@ def ensure_columns(df, required):
     return True
 
 def template_bytes(kind="ap"):
-    if kind=="ap":
+    """Create downloadable templates."""
+    if kind == "ap":
         df = pd.DataFrame({
             "Vendor":["Acme Ltd","Global Supplies"],
             "InvoiceNumber":["A-1001","G-3390"],
@@ -90,7 +87,8 @@ def template_bytes(kind="ap"):
             "Amount":[12500, 34800],
             "Currency":["USD","USD"]
         })
-    elif kind=="ar":
+
+    elif kind == "ar":
         df = pd.DataFrame({
             "Customer":["Client A","Client B"],
             "InvoiceNumber":["INV-501","INV-502"],
@@ -99,23 +97,34 @@ def template_bytes(kind="ap"):
             "Amount":[22000, 18500],
             "Currency":["USD","USD"]
         })
-    else:  # gl
+
+    else:  # gl (90 rows exactly)
+        n = 90
+        dates = [TODAY - timedelta(days=i) for i in range(n)][::-1]  # <-- FIXED: 90 items
+        # Make accounts exactly 90 rows
+        pattern = ["Cash", "Expense", "Expense", "Revenue"]
+        accounts = (pattern * (n // len(pattern))) + pattern[:(n % len(pattern))]
+        desc = ["Opening/Activity"] * n
+        debit = [0] * n
+        credit = [0] * n
+        # Synthetic amounts (positive revenue, negative expense)
+        amt = []
+        for a in accounts:
+            if a.lower() == "revenue":
+                amt.append(int(np.random.randint(8000, 15000)))
+            elif a.lower() == "expense":
+                amt.append(int(-np.random.randint(4000, 9000)))
+            else:
+                amt.append(0)
         df = pd.DataFrame({
-            "Date":[TODAY - timedelta(days=i) for i in range(1,90)][::-1],
-            "Account":["Cash","Expense","Expense","Revenue"]*22 + ["Cash","Revenue"],
-            "Description":["Opening/Activity"]*90,
-            "Debit":[0]*90,
-            "Credit":[0]*90,
-            "Amount":[
-                # simple synthetic series: +revenue, -expense; cash unaffected row is ignored
-                *np.random.normal(0,1,90)
-            ]
+            "Date": dates,
+            "Account": accounts,
+            "Description": desc,
+            "Debit": debit,
+            "Credit": credit,
+            "Amount": amt
         })
-        # Make the GL more realistic: derive Amount from Account
-        df["Amount"] = np.where(df["Account"].eq("Revenue"),
-                                np.random.randint(8000, 15000, len(df)),
-                        np.where(df["Account"].eq("Expense"),
-                                -np.random.randint(4000, 9000, len(df)), 0))
+
     buf = io.BytesIO()
     df.to_excel(buf, index=False, sheet_name="Template")
     buf.seek(0)
@@ -146,16 +155,14 @@ st.markdown(
 )
 
 # -----------------------------
-# Upload actions row
+# Uploads row
 # -----------------------------
 ap_file, ar_file, gl_file, run_fc = prep_upload_area()
-
 st.divider()
-
 tabs = st.tabs(["Payables Management", "Receivables", "Cash Forecast"])
 
 # -----------------------------
-# Read inputs (lazy)
+# Read inputs
 # -----------------------------
 ap_df = read_any(ap_file) if ap_file else None
 ar_df = read_any(ar_file) if ar_file else None
@@ -195,7 +202,6 @@ with tabs[2]:
     st.caption("Dynamic Forecast: This forecast automatically updates based on your payables/receivables selections. "
                "Selected payments will impact cash flow in their scheduled payment weeks.")
     
-    # Controls
     left, mid, right = st.columns([1.2,1.2,1.2])
     with left:
         base_cash = st.number_input("Current Cash (Beginning of Week 1)", min_value=0.0, value=0.0, step=1000.0, format="%.2f")
@@ -205,11 +211,10 @@ with tabs[2]:
     with right:
         include_gl_ops = st.checkbox("Use last 90 days GL to estimate weekly Opex/Payroll", value=True)
 
-    # Compute forecast table
     table = empty_13w()
     week_cols = [c for c in table.columns if c.startswith("Week")]
 
-    # Collections from AR
+    # Inflows from AR
     if ar_df is not None and ensure_columns(ar_df, ["DueDate","Amount"]):
         df = ar_df.copy()
         df["DueDate"] = df["DueDate"].apply(coerce_date)
@@ -218,7 +223,7 @@ with tabs[2]:
         for i in range(13):
             table.loc[table["Category"].eq("Collections"), f"Week {i+1}"] = float(df.loc[df["w"].eq(i), "Amount"].sum())
 
-    # AP payments out
+    # Outflows from AP
     if ap_df is not None and ensure_columns(ap_df, ["DueDate","Amount"]):
         df = ap_df.copy()
         df["DueDate"] = df["DueDate"].apply(coerce_date)
@@ -227,43 +232,40 @@ with tabs[2]:
         for i in range(13):
             table.loc[table["Category"].eq("AP Payments"), f"Week {i+1}"] = float(df.loc[df["w"].eq(i), "Amount"].sum())
 
-    # Estimate Operating Expenses & Payroll from GL (simple heuristic)
+    # Estimate Opex/Payroll from GL (simple heuristic)
     weekly_opex = 0.0
     weekly_payroll = 0.0
     if include_gl_ops and gl_df is not None:
         g = gl_df.copy()
-        # Expected minimal columns: Date, Account, Amount
+        # Guess column names
         guessed = {"date":"Date","account":"Account","amount":"Amount"}
         for c in list(g.columns):
             lc = c.lower()
             if "date" in lc: guessed["date"] = c
             if "acc" in lc:  guessed["account"] = c
             if "amount" in lc or "debit" in lc or "credit" in lc: guessed["amount"] = c
+
         g[guessed["date"]] = pd.to_datetime(g[guessed["date"]], errors="coerce")
         g = g.dropna(subset=[guessed["date"]])
         g["Amount"] = pd.to_numeric(g[guessed["amount"]], errors="coerce").fillna(0.0)
-        # crude tags
+
         acct = g[guessed["account"]].astype(str).str.lower()
         opex = g.loc[acct.str.contains("expens|utilities|rent|marketing|admin"), "Amount"]
         payroll = g.loc[acct.str.contains("payroll|salary|wage"), "Amount"]
-        # expenses expected as negatives; use absolute spend per week estimate
+
         if len(opex):
-            weekly_opex = abs(opex.mean())  # mean daily/row; below we scale to weekly
+            weekly_opex = abs(opex.mean()) * 5  # rough weekly scale
         if len(payroll):
-            weekly_payroll = abs(payroll.mean())
-        # Scale roughness: assume each row ~ 1 day; weekly ≈ 5x of row mean (business days)
-        weekly_opex *= 5
-        weekly_payroll *= 5
+            weekly_payroll = abs(payroll.mean()) * 5
 
     for i in range(13):
         wcol = f"Week {i+1}"
         inflows = table.loc[table["Category"].eq("Collections"), wcol] + table.loc[table["Category"].eq("Other Inflows"), wcol]
         table.loc[table["Category"].eq("Total Inflows"), wcol] = inflows
 
-        # Outflows components
-        if weekly_opex>0:
+        if weekly_opex > 0:
             table.loc[table["Category"].eq("Operating Expenses"), wcol] = weekly_opex
-        if weekly_payroll>0:
+        if weekly_payroll > 0:
             table.loc[table["Category"].eq("Payroll"), wcol] = weekly_payroll
 
         outflows = (table.loc[table["Category"].eq("Operating Expenses"), wcol] +
@@ -271,15 +273,16 @@ with tabs[2]:
                     table.loc[table["Category"].eq("AP Payments"), wcol] +
                     table.loc[table["Category"].eq("Capex"), wcol] +
                     table.loc[table["Category"].eq("Debt Service"), wcol])
+
         table.loc[table["Category"].eq("Total Outflows"), wcol] = outflows
         table.loc[table["Category"].eq("Net Cash Flow"), wcol] = inflows - outflows
 
-    # Roll forward beginning/ending cash
+    # Roll-forward
     table.loc[table["Category"].eq("Beginning Cash"), "Week 1"] = base_cash
     for i in range(13):
         w = f"Week {i+1}"
-        beg = table.loc[table["Category"].eq("Beginning Cash"), w].values[0]
-        net = table.loc[table["Category"].eq("Net Cash Flow"), w].values[0]
+        beg = float(table.loc[table["Category"].eq("Beginning Cash"), w])
+        net = float(table.loc[table["Category"].eq("Net Cash Flow"), w])
         end = beg + net
         table.loc[table["Category"].eq("Ending Cash"), w] = end
         if i < 12:
@@ -287,10 +290,10 @@ with tabs[2]:
             table.loc[table["Category"].eq("Beginning Cash"), wnext] = end
 
     # KPIs
-    end_w1 = table.loc[table["Category"].eq("Ending Cash"), "Week 1"].values[0]
-    ending_13 = table.loc[table["Category"].eq("Ending Cash"), "Week 13"].values[0]
-    end_series = table.loc[table["Category"].eq("Ending Cash"), week_cols].T[table.loc[table["Category"].eq("Ending Cash"), week_cols].T.columns[0]].values
-    min_idx = int(np.argmin(end_series))
+    end_w1 = float(table.loc[table["Category"].eq("Ending Cash"), "Week 1"])
+    ending_13 = float(table.loc[table["Category"].eq("Ending Cash"), "Week 13"])
+    end_series = table.loc[table["Category"].eq("Ending Cash"), week_cols].values.flatten()  # <-- simplified
+    min_idx = int(np.argmin(end_series)) + 1  # <-- display as Week 1..13
     min_val = float(np.min(end_series))
 
     k1, k2, k3, k4 = st.columns(4)
@@ -301,24 +304,24 @@ with tabs[2]:
 
     st.info("Dynamic Forecast: This forecast automatically updates based on your payables selections. Selected payments will impact cash flow in their scheduled payment weeks.")
 
-    # Display table (formatted)
+    # Show table (formatted)
     show = table.copy()
     for c in week_cols:
         show[c] = show[c].apply(money)
     st.dataframe(show, use_container_width=True, height=520)
 
-    # Download forecast
+    # Download
     buf = io.BytesIO()
     table.to_excel(buf, index=False, sheet_name="13-Week Forecast")
     buf.seek(0)
     st.download_button("Download 13-Week Forecast (.xlsx)", data=buf,
                        file_name="cash_forecast_13w.xlsx", use_container_width=True)
 
-    # Tiny chart
+    # Trend chart
     st.markdown("#### Ending Cash Trend (13 Weeks)")
     trend = pd.DataFrame({
         "Week": list(range(1,14)),
-        "EndingCash": table.loc[table["Category"].eq("Ending Cash"), week_cols].values.flatten().tolist()
+        "EndingCash": end_series.tolist()
     })
     st.line_chart(trend, x="Week", y="EndingCash", height=220, use_container_width=True)
 
